@@ -320,6 +320,11 @@ done
 
 wait_for_socket /tmp/unix_uds1 30000 "/!\ Timeout waiting for gklib to start"
 
+# Recover K3SysUi if it terminates unexpectedly after normal startup.
+if [ -x "$RINKHALS_ROOT/opt/rinkhals/scripts/k3sysui-watchdog.sh" ] && [ -x /userdata/app/gk/K3SysUi.patch ]; then
+    "$RINKHALS_ROOT/opt/rinkhals/scripts/k3sysui-watchdog.sh" &
+fi
+
 
 ################
 log "> Starting apps..."
