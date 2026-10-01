@@ -10,6 +10,35 @@ fi
 
 
 ################
+log "> Stopping K3SysUi watchdog..."
+
+K3SYSUI_WATCHDOG_PID=$(cat /tmp/rinkhals/k3sysui-watchdog.pid 2> /dev/null)
+if [ "$K3SYSUI_WATCHDOG_PID" != "" ] && [ -r "/proc/$K3SYSUI_WATCHDOG_PID/cmdline" ]; then
+    K3SYSUI_WATCHDOG_CMD=$(tr "\000" " " < "/proc/$K3SYSUI_WATCHDOG_PID/cmdline" 2> /dev/null)
+    case "$K3SYSUI_WATCHDOG_CMD" in
+        *k3sysui-watchdog.sh*)
+            kill "$K3SYSUI_WATCHDOG_PID" 2> /dev/null
+            K3SYSUI_WATCHDOG_WAIT=0
+            while [ -e "/proc/$K3SYSUI_WATCHDOG_PID" ] && [ "$K3SYSUI_WATCHDOG_WAIT" -lt 20 ]; do
+                msleep 250
+                K3SYSUI_WATCHDOG_WAIT=$((K3SYSUI_WATCHDOG_WAIT + 1))
+            done
+            if [ -r "/proc/$K3SYSUI_WATCHDOG_PID/cmdline" ]; then
+                K3SYSUI_WATCHDOG_CMD=$(tr "\000" " " < "/proc/$K3SYSUI_WATCHDOG_PID/cmdline" 2> /dev/null)
+                case "$K3SYSUI_WATCHDOG_CMD" in
+                    *k3sysui-watchdog.sh*)
+                        log "/!\ Timeout waiting for K3SysUi watchdog to stop"
+                        exit 1
+                        ;;
+                esac
+            fi
+            ;;
+    esac
+fi
+rm -f /tmp/rinkhals/k3sysui-watchdog.pid
+
+
+################
 log "> Stopping apps..."
 
 APPS=$(list_apps)
