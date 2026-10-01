@@ -38,5 +38,18 @@ if [ -f "$SPOOLMAN_FILE" ] && ! grep -q "SPOOL_ID: Union\[int, None\]" "$SPOOLMA
 	fi
 fi
 
+# GoKlipper sends some notifications with the remote method in
+# template.method instead of the top-level method field expected by Moonraker.
+# Normalize registered template methods so G-code responses reach clients.
+KLIPPY_CONNECTION_FILE="$MOONRAKER_DIRECTORY/moonraker/moonraker/components/klippy_connection.py"
+if [ -f "$KLIPPY_CONNECTION_FILE" ] && ! grep -q "GoKlipper compatibility" "$KLIPPY_CONNECTION_FILE"; then
+	perl -0pi -e 's/        method = cmd\.get\('"'"'method'"'"', None\)\n        if method is not None:/        method = cmd.get('"'"'method'"'"', None)\n\n        # GoKlipper compatibility: some notifications put the remote method\n        # in template.method rather than the top-level method field.\n        if method is None:\n            template = cmd.get('"'"'template'"'"')\n            if isinstance(template, dict):\n                template_method = template.get('"'"'method'"'"')\n                params = cmd.get('"'"'params'"'"', {})\n                if (\n                    template_method in self.remote_methods and\n                    isinstance(params, dict)\n                ):\n                    self.event_loop.register_callback(\n                        self._execute_method, template_method, **params)\n                    return\n\n        if method is not None:/' "$KLIPPY_CONNECTION_FILE"
+
+	if ! grep -q "GoKlipper compatibility" "$KLIPPY_CONNECTION_FILE"; then
+		echo "ERROR: klippy_connection.py GoKlipper compatibility patch did not apply - did upstream Moonraker change _process_command?" >&2
+		exit 1
+	fi
+fi
+
 VERSION=$(echo $MOONRAKER_COMMIT | cut -c1-7)
 sed -i "s/\"version\": *\"[^\"]*\"/\"version\": \"${VERSION}\"/" $MOONRAKER_DIRECTORY/app.json
