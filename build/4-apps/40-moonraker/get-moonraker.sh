@@ -38,5 +38,64 @@ if [ -f "$SPOOLMAN_FILE" ] && ! grep -q "SPOOL_ID: Union\[int, None\]" "$SPOOLMA
 	fi
 fi
 
+
+# Keep temporary-file uploads atomic when Moonraker's temp directory and the
+# destination are on different filesystems.  shutil.move() falls back to
+# copy/delete on EXDEV and truncates an existing destination in place.
+FILE_MANAGER="$MOONRAKER_DIRECTORY/moonraker/moonraker/components/file_manager/file_manager.py"
+if [ -f "$FILE_MANAGER" ] && ! grep -q "def _atomic_move_file" "$FILE_MANAGER"; then
+	sed -i '/^import os$/a import errno' "$FILE_MANAGER"
+
+	sed -i '/^    def _zip_files(/i\
+    @staticmethod\
+    def _atomic_move_file(source: StrOrPath, destination: StrOrPath) -> None:\
+        source = pathlib.Path(source)\
+        destination = pathlib.Path(destination)\
+        try:\
+            os.replace(source, destination)\
+            return\
+        except OSError as e:\
+            if e.errno != errno.EXDEV:\
+                raise\
+\
+        temp_path: Optional[pathlib.Path] = None\
+        try:\
+            with tempfile.NamedTemporaryFile(\
+                dir=str(destination.parent),\
+                prefix=f".{destination.name}.",\
+                suffix=".tmp",\
+                delete=False\
+            ) as temp_file:\
+                temp_path = pathlib.Path(temp_file.name)\
+                with source.open("rb") as src_file:\
+                    shutil.copyfileobj(src_file, temp_file)\
+                temp_file.flush()\
+                os.fsync(temp_file.fileno())\
+\
+            shutil.copystat(source, temp_path)\
+            os.replace(temp_path, destination)\
+            temp_path = None\
+            source.unlink()\
+        finally:\
+            if temp_path is not None:\
+                with contextlib.suppress(OSError):\
+                    temp_path.unlink()\
+' "$FILE_MANAGER"
+
+	sed -i 's|        shutil.move(str(temp_dest), str(destination))|        self._atomic_move_file(temp_dest, destination)|' "$FILE_MANAGER"
+	sed -i "/                shutil.move(/ {N; s|                shutil.move(\\n                    upload_info\\['tmp_file_path'\\], dest_path)|                self._atomic_move_file(upload_info['tmp_file_path'], dest_path)|;}" "$FILE_MANAGER"
+fi
+
+# Fail the build if a Moonraker update or reformatting makes the compatibility
+# patch miss.  This patch is intentionally tied to the pinned Moonraker source
+# and can be removed once the pinned revision contains the upstream fix.
+if ! grep -q "^import errno$" "$FILE_MANAGER" ||
+   ! grep -q "def _atomic_move_file" "$FILE_MANAGER" ||
+   ! grep -q "self._atomic_move_file(temp_dest, destination)" "$FILE_MANAGER" ||
+   ! grep -q "self._atomic_move_file(upload_info\\['tmp_file_path'\\], dest_path)" "$FILE_MANAGER"; then
+	echo "ERROR: Moonraker atomic temp-file move patch did not apply - did upstream file_manager.py change?" >&2
+	exit 1
+fi
+
 VERSION=$(echo $MOONRAKER_COMMIT | cut -c1-7)
 sed -i "s/\"version\": *\"[^\"]*\"/\"version\": \"${VERSION}\"/" $MOONRAKER_DIRECTORY/app.json
