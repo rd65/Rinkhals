@@ -440,8 +440,8 @@ class KobraStatusPatcherTests(unittest.TestCase):
     def test_registered_patcher_receives_status_and_is_subscription_update(self):
         received = []
 
-        def patcher(status, is_subscription_update):
-            received.append((status, is_subscription_update))
+        def patcher(status, is_subscription_update, requested):
+            received.append((status, is_subscription_update, requested))
             return status
 
         self.kobra.register_status_patcher(patcher)
@@ -450,17 +450,117 @@ class KobraStatusPatcherTests(unittest.TestCase):
         self.assertEqual(len(received), 1)
         self.assertEqual(received[0][0], {"foo": "bar"})
         self.assertIs(received[0][1], True)
+        # No request context: None means "caller does not know".
+        self.assertIsNone(received[0][2])
+
+    def test_patch_status_forwards_requested_objects(self):
+        received = []
+        self.kobra.register_status_patcher(
+            lambda status, is_sub, requested: (received.append(requested), status)[1]
+        )
+
+        self.kobra.patch_status({}, requested={"print_stats"})
+        self.kobra.patch_status({}, requested=())
+
+        self.assertEqual(received, [{"print_stats"}, ()])
 
     def test_patch_status_defaults_is_subscription_update_to_false(self):
         received = []
         self.kobra.register_status_patcher(
-            lambda status, is_sub: (received.append(is_sub), status)[1]
+            lambda status, is_sub, requested: (received.append(is_sub), status)[1]
         )
 
         self.kobra.patch_status({})
 
         self.assertEqual(received, [False])
 
+
+
+class KobraRequestedObjectsTests(unittest.IsolatedAsyncioTestCase):
+    """objects/query must return only what was asked for (issue #140)."""
+
+    PANDA = {"webhooks": None, "virtual_sdcard": None, "print_stats": None,
+             "extruder": None, "heater_bed": None, "gcode_macro _KNOMI_STATUS": None}
+
+    @classmethod
+    def setUpClass(cls):
+        cls.module = load_kobra_module()
+
+    def setUp(self):
+        self.connection_module = _build_klippy_connection_module()
+        self.kobra = self.module.Kobra.__new__(self.module.Kobra)
+        self.kobra.status_patchers = []
+
+        # Behaves like MmuAcePatcher: adds mmu objects only when asked.
+        def mmu_patcher(status, is_sub, requested):
+            for name in ("mmu", "mmu_machine"):
+                if requested is None or name in requested:
+                    status[name] = {"from": "patcher"}
+            return status
+        self.kobra.register_status_patcher(mmu_patcher)
+
+    async def _call(self, endpoint, objects, inner):
+        self.connection_module.KlippyConnection.request = inner
+        self.kobra.patch_requested_objects()
+        conn = self.connection_module.KlippyConnection()
+        request = FakeObjectsWebRequest(endpoint, {"objects": dict(objects)})
+        return await self.connection_module.KlippyConnection.request(conn, request)
+
+    @staticmethod
+    def _inner_returning(extra):
+        async def inner(me, web_request):
+            names = list(web_request.get_args().get("objects", {}))
+            status = {name: {} for name in names}
+            status.update(extra)
+            return {"status": status, "eventtime": 1.0}
+        return inner
+
+    async def test_query_drops_objects_the_client_did_not_ask_for(self):
+        inner = self._inner_returning({"idle_timeout": {"state": "printing"}})
+        result = await self._call("objects/query", self.PANDA, inner)
+
+        self.assertEqual(set(result["status"]), set(self.PANDA))
+        self.assertNotIn("idle_timeout", result["status"])
+        self.assertNotIn("mmu", result["status"])
+        self.assertNotIn("mmu_machine", result["status"])
+
+    async def test_query_still_returns_mmu_when_requested(self):
+        inner = self._inner_returning({})
+        result = await self._call("objects/query", {"mmu": None, "print_stats": None}, inner)
+
+        self.assertEqual(result["status"]["mmu"], {"from": "patcher"})
+        self.assertNotIn("mmu_machine", result["status"])
+
+    async def test_requested_names_are_captured_before_inner_patches_edit_them(self):
+        # patch_bed_mesh deletes bed_mesh from the request before gklib sees
+        # it and adds it back to the result. Pruning against the edited list
+        # would throw the heightmap away.
+        async def inner(me, web_request):
+            del web_request.get_args()["objects"]["bed_mesh"]
+            return {"status": {"bed_mesh": {"profile_name": "default"}, "print_stats": {}}}
+
+        result = await self._call("objects/query", {"bed_mesh": None, "print_stats": None}, inner)
+        self.assertEqual(result["status"]["bed_mesh"], {"profile_name": "default"})
+
+    async def test_subscribe_is_not_pruned_but_mmu_still_needs_requesting(self):
+        inner = self._inner_returning({"idle_timeout": {"state": "printing"}})
+
+        plain = await self._call("objects/subscribe", {"print_stats": None}, inner)
+        self.assertIn("idle_timeout", plain["status"])
+        self.assertNotIn("mmu", plain["status"])
+
+        with_mmu = await self._call("objects/subscribe", {"print_stats": None, "mmu": None}, inner)
+        self.assertEqual(with_mmu["status"]["mmu"], {"from": "patcher"})
+
+    async def test_other_endpoints_are_left_untouched(self):
+        async def inner(me, web_request):
+            return {"status": {"anything": 1}}
+        self.connection_module.KlippyConnection.request = inner
+        self.kobra.patch_requested_objects()
+        conn = self.connection_module.KlippyConnection()
+        request = FakeObjectsWebRequest("gcode/script", {"script": "G28"})
+        result = await self.connection_module.KlippyConnection.request(conn, request)
+        self.assertEqual(result, {"status": {"anything": 1}})
 
 if __name__ == "__main__":
     unittest.main()

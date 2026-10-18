@@ -112,7 +112,7 @@ class Kobra:
 
     # GCode handlers
     gcode_handlers: dict[str, FlexCallback] = {}
-    status_patchers: List[Callable[[dict, bool], dict]] = []
+    status_patchers: List[Callable[..., dict]] = []
     print_data_patchers: List[Callable[[dict], dict]] = []
 
     def __init__(self, config):
@@ -163,6 +163,9 @@ class Kobra:
         self.patch_k2p_bug()
         self.patch_klipper_restart()
         self.patch_ace_flush_control()
+        # Must stay last: it has to wrap every other request patch so it sees
+        # the client's objects before any of them edit the request.
+        self.patch_requested_objects()
 
         logging.info('Completed Kobra patching! Yay!')
 
@@ -722,7 +725,7 @@ class Kobra:
         )
 
 
-    def patch_status(self, status, is_subscription_update=False):
+    def patch_status(self, status, is_subscription_update=False, requested=None):
         if self.is_goklipper_running():
 
             if 'print_stats' in status:
@@ -818,15 +821,17 @@ class Kobra:
                     self._normalize_exclude_object_status(status['exclude_object'], objects)
 
         for patcher in self.status_patchers:
-            status = patcher(status, is_subscription_update)
+            status = patcher(status, is_subscription_update, requested)
 
         if self.is_goklipper_running():
             self._maybe_force_end_excluded_object(status)
 
         return status
 
-    # patcher(status: dict, is_subscription_update: bool) -> dict
-    def register_status_patcher(self, patcher: Callable[[dict, bool], dict]):
+    # patcher(status: dict, is_subscription_update: bool, requested: Optional[set]) -> dict
+    # requested is None when the caller cannot know what the client asked for
+    # (add everything), or the set of requested object names (add only those).
+    def register_status_patcher(self, patcher: Callable[..., dict]):
         self.status_patchers.append(patcher)
 
     def register_print_data_patcher(self, patcher: Callable[[dict], dict]):
@@ -842,7 +847,9 @@ class Kobra:
             async def _send_klippy_request(me, method, params, default = Sentinel.MISSING, transport = None):
                 result = await original__send_klippy_request(me, method, params, default, transport)
                 if result and isinstance(result, dict) and 'status' in result:
-                    result['status'] = self.patch_status(result['status'])
+                    # Patcher objects (mmu) are added by patch_requested_objects(),
+                    # which is the only layer that knows what the caller asked for.
+                    result['status'] = self.patch_status(result['status'], requested=())
                 return result
             return _send_klippy_request
 
@@ -896,7 +903,8 @@ class Kobra:
         def wrap_set_result(original_set_result):
             def set_result(me, result):
                 if isinstance(result, dict) and 'status' in result:
-                    result['status'] = self.patch_status(result['status'])
+                    # See patch_requested_objects(): patcher objects are added there.
+                    result['status'] = self.patch_status(result['status'], requested=())
                 original_set_result(me, result)
             return set_result
 
@@ -913,7 +921,8 @@ class Kobra:
                 if result and isinstance(result, dict):
                     logging.debug(f'Wrap request method {rpc_method} result: {json.dumps(result)}')
                 if result and isinstance(result, dict) and 'status' in result:
-                    result['status'] = self.patch_status(result['status'])
+                    # See patch_requested_objects(): patcher objects are added there.
+                    result['status'] = self.patch_status(result['status'], requested=())
                     logging.debug(f'Wrap request method {rpc_method} result status: {json.dumps(result)}')
                 return result
             return request
@@ -1018,6 +1027,62 @@ class Kobra:
     def register_gcode_handler(self, cmd, callback: FlexCallback):
         logging.info(f'> Registering gcode handler for {cmd}...')
         self.gcode_handlers[cmd.upper()] = callback
+
+    def patch_requested_objects(self):
+        """Answer objects/query with only the objects the client asked for.
+
+        Several patches add objects to status responses: patch_status()
+        injects idle_timeout whenever print_stats.state is present, and the MMU
+        patcher merged mmu and mmu_machine into every query. Upstream Moonraker
+        returns exactly what was requested. Some clients cannot cope with the
+        extra data: BIQU Panda Breath silently ignores responses over roughly
+        1.5 KB, so in Auto mode it never saw the bed target and never turned
+        its heater on (issue #140). A 316 byte reply became 2765 bytes.
+
+        This wrapper is installed after every other request patch, so it is the
+        outermost layer and sees the client's object list before inner patches
+        edit it (patch_bed_mesh, for example, deletes bed_mesh from the request
+        before it reaches gklib and adds it back to the result).
+
+        For objects/query and objects/subscribe it adds patcher objects (mmu)
+        only if they were requested, which also keeps the MMU diff cache from
+        advancing for clients that never asked for MMU. For objects/query it
+        then drops anything that was not requested. Subscribe responses are
+        already pruned by Moonraker itself, and are otherwise left as they were.
+        """
+        from .klippy_connection import KlippyConnection
+
+        logging.info('> Patching object queries to return only requested objects...')
+
+        def wrap_request(original_request):
+            async def request(me, web_request: WebRequest) -> Any:
+                rpc_method = web_request.get_endpoint()
+
+                requested = None
+                if rpc_method in ('objects/query', 'objects/subscribe'):
+                    args = web_request.get_args()
+                    objects = args.get('objects') if isinstance(args, dict) else None
+                    if isinstance(objects, dict):
+                        # Copy the names now; inner patches mutate this dict.
+                        requested = set(objects.keys())
+
+                result = await original_request(me, web_request)
+
+                if (requested is not None and isinstance(result, dict) and
+                        isinstance(result.get('status'), dict)):
+                    status = result['status']
+                    for patcher in self.status_patchers:
+                        status = patcher(status, False, requested)
+                    if rpc_method == 'objects/query':
+                        status = {name: value for name, value in status.items() if name in requested}
+                    result['status'] = status
+
+                return result
+            return request
+
+        logging.debug(f'  Before: {KlippyConnection.request}')
+        setattr(KlippyConnection, 'request', wrap_request(KlippyConnection.request))
+        logging.debug(f'  After: {KlippyConnection.request}')
 
     def patch_gcode_handler(self):
         from .klippy_apis import KlippyAPI

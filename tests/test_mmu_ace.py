@@ -486,6 +486,38 @@ class MmuAcePatchStatusTests(unittest.TestCase):
 
         self.assertEqual(status, {"mmu": {"gate": 0}})
 
+    def test_query_not_requesting_mmu_adds_nothing_and_leaves_cache_alone(self):
+        # Panda Breath's actual object list (issue #140).
+        patcher = self._make_patcher({"mmu": {"gate": 1}, "mmu_machine": {"num_units": 1}})
+        requested = {"webhooks", "virtual_sdcard", "print_stats", "extruder",
+                     "heater_bed", "gcode_macro _KNOMI_STATUS"}
+
+        status = patcher.patch_status({"print_stats": {}}, False, requested)
+
+        self.assertEqual(status, {"print_stats": {}})
+        self.assertEqual(patcher._last_pushed_mmu_status, {})
+
+    def test_query_requesting_one_mmu_object_adds_and_caches_only_that(self):
+        patcher = self._make_patcher({"mmu": {"gate": 1}, "mmu_machine": {"num_units": 1}})
+
+        status = patcher.patch_status({}, False, {"mmu"})
+
+        self.assertEqual(status, {"mmu": {"gate": 1}})
+        self.assertEqual(patcher._last_pushed_mmu_status, {"mmu": {"gate": 1}})
+
+    def test_polling_client_without_mmu_cannot_swallow_a_subscriber_update(self):
+        """A client polling objects/query for other objects used to advance
+        the MMU diff cache on every poll. If a poll landed between an MMU
+        change and the next push, subscribers never saw the change (#125)."""
+        patcher = self._make_patcher({"mmu": {"gate": 0}})
+        patcher.patch_status({}, is_subscription_update=True)      # baseline X
+
+        patcher.get_status = lambda: {"mmu": {"gate": 1}}          # change to Y
+        patcher.patch_status({}, False, {"print_stats", "heater_bed"})  # unrelated poll
+
+        status = patcher.patch_status({}, is_subscription_update=True)
+        self.assertEqual(status, {"mmu": {"gate": 1}})
+
     def test_reinit_resets_mmu_status_cache(self):
         patcher = self.module.MmuAcePatcher.__new__(self.module.MmuAcePatcher)
         patcher._auto_feed_task = None

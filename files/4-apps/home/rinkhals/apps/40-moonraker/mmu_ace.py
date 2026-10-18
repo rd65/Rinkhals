@@ -2420,13 +2420,28 @@ class MmuAcePatcher:
         reset."""
         self._last_pushed_mmu_status = {}
 
-    def patch_status(self, status: dict, is_subscription_update: bool = False):
+    def patch_status(self, status: dict, is_subscription_update: bool = False,
+                     requested=None):
+        """Merge MMU objects into a status dict.
+
+        requested is the set of object names the client asked for, on the
+        query/subscribe response path. None means "unknown, add everything"
+        (the historical behaviour); an empty collection adds nothing.
+
+        Only objects that are actually handed to a client may update the diff
+        cache. A client that polls objects/query without asking for mmu (Panda
+        Breath, Home Assistant) used to advance the cache on every poll without
+        anyone receiving the value, which could swallow a pending change for
+        the clients that are subscribed to mmu (issues #140, #125).
+        """
 
         mmu_status = self.get_status()
 
         # return the full, current status
         if not is_subscription_update:
             for key, value in mmu_status.items():
+                if requested is not None and key not in requested:
+                    continue
                 status[key] = value
                 # Keep the diff cache in sync even on the non-subscription
                 # (query) path. Without this, a query response can hand a
