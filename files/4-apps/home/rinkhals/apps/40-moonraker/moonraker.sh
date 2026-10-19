@@ -36,12 +36,16 @@ cleanup() {
         kill -TERM $MOONRAKER_PID 2>/dev/null
 
         # Wait up to 10 seconds for graceful shutdown
-        for i in {1..10}; do
+        # busybox ash has no brace expansion, so "for i in {1..10}" ran exactly
+        # once and Moonraker got about a second before being force killed.
+        i=0
+        while [ $i -lt 10 ]; do
             if ! kill -0 $MOONRAKER_PID 2>/dev/null; then
                 echo "$(date): Moonraker stopped gracefully" >> $RINKHALS_ROOT/logs/app-moonraker.log
                 break
             fi
             sleep 1
+            i=$((i + 1))
         done
 
         # Force kill if still running
