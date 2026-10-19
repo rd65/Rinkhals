@@ -8,6 +8,7 @@ import filecmp
 import json
 import ast
 import logging
+import inspect
 import os
 import re
 import asyncio
@@ -39,6 +40,8 @@ from typing import (
 
 # Import at runtime for actual use
 from ..common import WebRequest, APITransport, RequestType
+from .mmu_ace_spool_store import MmuAceSpoolStore
+from .mmu_ace_spool_matcher import MmuAceSpoolMatcher, SpoolmanUnavailable
 
 if TYPE_CHECKING:
     FlexCallback = Callable[..., Optional[Coroutine]]
@@ -495,7 +498,19 @@ def hex_to_rgb(hex: str) -> List[int]:
     return [int(hex[i:i+2], 16) for i in (0, 2, 4)]
 
 def hex_to_rgba(hex: str) -> List[int]:
-    return [int(hex[i:i+2], 16) for i in (0, 2, 4, 6)]
+    """Parse RRGGBB or RRGGBBAA, with or without a leading '#'.
+
+    The two shipped UIs disagree: Fluidd echoes back the 8-digit value from the
+    mmu status, while Mainsail forwards Spoolman's 6-digit filament.color_hex.
+    Requiring 8 digits made any colour coming from Spoolman raise ValueError out
+    of the gcode handler.
+    """
+    value = (hex or "").strip().lstrip("#")
+    if len(value) == 6:
+        value += "FF"
+    if len(value) != 8:
+        raise ValueError(f"expected an RRGGBB or RRGGBBAA colour, got {hex!r}")
+    return [int(value[i:i+2], 16) for i in (0, 2, 4, 6)]
 
 def get_material_temperature(material: str) -> int:
     """Get default printing temperature for material type"""
@@ -597,7 +612,10 @@ class MmuAceController:
 
     printer: PrinterController
 
-    def __init__(self, server: Server, host: str | None):
+
+    def __init__(self, server: Server, host: str | None,
+                 spool_forget_after: float = MmuAceSpoolStore.DEFAULT_FORGET_AFTER_S,
+                 auto_match_mode: str = "off"):
         self.server = server
         self.eventloop = self.server.get_event_loop()
         self._last_status_update = 0.0
@@ -609,6 +627,26 @@ class MmuAceController:
         self._status_update_delay = 0.2  # 200ms debounce for rapid commands
         self._throttle_delay = 0.3  # 300ms minimum delay between updates (max 3/sec)
         self._pending_update = False  # Flag to track if update is needed
+
+        # Spoolman IDs the user assigned, by global gate index. This map is the
+        # authority: _set_ace_status() rebuilds every gate from raw hub data on
+        # each poll, so anything held only on the gate object is transient. Only
+        # IDs from here reach Spoolman (#89, #107, #141).
+        self._manual_spool_overrides: dict[int, int] = {}
+        # ...and the same assignments on disk, so they survive a restart.
+        self._spool_store = MmuAceSpoolStore(self.server, forget_after=spool_forget_after)
+
+        # Off unless asked for; see MmuAceSpoolMatcher for how a gate is matched.
+        self._matcher = MmuAceSpoolMatcher(server, auto_match_mode)
+        self._auto_match_inflight: set = set()
+        # The spool each gate was last matched against, so a gate is only asked
+        # about when what is in it changes. See _maybe_auto_match.
+        self._auto_match_seen: dict = {}
+
+        # Strong references to fire-and-forget tasks: asyncio keeps only a weak
+        # one, so a task nobody holds can be collected part-way through. That bit
+        # on real hardware - see _spawn.
+        self._background_tasks: set = set()
 
         # LRU Cache for filament temperature info (key: "unit_id-gate_index-sku")
         # Limit to 16 entries (2x max gates) to prevent memory leak
@@ -638,6 +676,14 @@ class MmuAceController:
         # Start periodic cache cleanup task (runs every 60 seconds)
         # Removes expired temperature cache entries to prevent slow memory leak
         asyncio.create_task(self._periodic_cache_cleanup())
+
+        # Reading the store is async and __init__ is not, so it runs as a task.
+        # Assignments land a moment after startup and are picked up by the first
+        # status rebuild that sees a matching gate.
+        self._spawn(self._load_spool_assignments())
+
+    async def _load_spool_assignments(self):
+        await self._spool_store.load()
 
     @staticmethod
     def _is_no_ace_error(error: Exception) -> bool:
@@ -1131,6 +1177,12 @@ class MmuAceController:
             if self.ace.loaded_gate != TOOL_GATE_UNKNOWN or was_loaded:
                 logging.info("_sync_loaded_gate_from_current_filament: ACE Hub reports no loaded filament, clearing loaded state")
 
+            if previous_loaded_gate != TOOL_GATE_UNKNOWN:
+                # Guarded on the transition so this does not fire on every poll while
+                # idle. Nothing is loaded, so nothing should be debited - same
+                # reasoning as an unmapped gate in _activate_spoolman_for_gate.
+                self._spawn(self._activate_spoolman_for_gate(TOOL_GATE_UNKNOWN))
+
             self.ace.loaded_gate = TOOL_GATE_UNKNOWN
             self.ace.filament.pos = FILAMENT_POS_UNLOADED
 
@@ -1159,6 +1211,52 @@ class MmuAceController:
             self.ace.tool = global_gate  # Tool = Gate for ACE
 
         self.ace.filament.pos = FILAMENT_POS_LOADED
+
+        # The only hook that covers a real print. Print start (auto-feed) and
+        # firmware-driven tool changes go straight to the ACE and never reach
+        # _on_gcode_mmu_load, so hooking MMU_LOAD alone leaves Spoolman pointed at
+        # the previous spool for the whole print (see the discussion in #89).
+        if global_gate != previous_loaded_gate:
+            self._spawn(self._activate_spoolman_for_gate(global_gate))
+
+    async def _activate_spoolman_for_gate(self, gate_index: int):
+        """Point Moonraker's [spoolman] active spool at a gate's assigned spool.
+
+        Reads _manual_spool_overrides rather than gate.spool_id, so only an ID the
+        user actually asserted can ever reach Spoolman.
+
+        A gate with no assignment deactivates Spoolman's active spool instead of
+        leaving the previous one in place. Leaving it would keep debiting the spool
+        from the *previous* gate for filament it did not supply, and nothing in
+        Spoolman would later show those numbers to be wrong. Losing tracking for an
+        unmapped gate is recoverable; silently corrupting another spool's usage is
+        not. Moonraker supports a null active spool - it deactivates that way itself
+        when the active spool 404s.
+
+        Best-effort by design. This runs off the ACE status rebuild, so a Spoolman
+        outage must never propagate into the MMU component.
+        """
+        try:
+            spoolman = self.server.lookup_component("spoolman", None)
+            if spoolman is None:
+                return
+
+            spool_id = self._manual_spool_overrides.get(gate_index)
+            if not spool_id or spool_id <= 0:
+                spool_id = None
+
+            # Synchronous at the pinned Moonraker commit, but cheap to tolerate both.
+            result = spoolman.set_active_spool(spool_id)
+            if inspect.isawaitable(result):
+                await result
+
+            if spool_id is None:
+                logging.info(f"Gate {gate_index} loaded: no Spoolman spool assigned, "
+                             "active spool deactivated")
+            else:
+                logging.info(f"Gate {gate_index} loaded: active Spoolman spool set to {spool_id}")
+        except Exception as e:
+            logging.error(f"Error setting active Spoolman spool for gate {gate_index}: {e}")
 
     def _set_ace_status(self, filament_hub):
         # set units
@@ -1237,6 +1335,10 @@ class MmuAceController:
                     if temp_msg:
                         logging.info(temp_msg)
 
+                # Restore or drop this gate's remembered Spoolman assignment before
+                # the spool_id branches below read _manual_spool_overrides.
+                self._sync_spool_store(global_gate_index, gate, sku)
+
                 # Parse SKU for additional information
                 gate.sku = sku
                 if sku:
@@ -1244,11 +1346,12 @@ class MmuAceController:
                     gate.vendor = sku_info["vendor"]
                     gate.series = sku_info["series"]
                     gate.color_name = sku_info["color_name"]
-                    # Use serial number as spool_id if available
-                    try:
-                        gate.spool_id = int(sku_info["serial"]) if sku_info["serial"] else abs(hash(sku)) % (2**31)
-                    except:
-                        gate.spool_id = abs(hash(sku)) % (2**31)
+                    # Only an ID the user actually assigned. This used to be derived
+                    # from the SKU, which shares Spoolman's number space, so an
+                    # unmapped gate advertised a plausible but meaningless spool
+                    # (#107). What the user asserted and what the tag reported have
+                    # to stay distinct; the rest of the SKU parse is kept.
+                    gate.spool_id = self._manual_spool_overrides.get(global_gate_index, 0)
 
                     # Update filament_name with full description if parsed
                     if sku_info["vendor"] and sku_info["series"]:
@@ -1257,7 +1360,10 @@ class MmuAceController:
                             parts.append(sku_info["color_name"])
                         gate.filament_name = " ".join(parts)
                 else:
-                    gate.spool_id = 0
+                    # No RFID tag, so nothing to derive an ID from. Keep whatever the
+                    # user assigned; this branch used to zero it on every poll, which
+                    # is what untagged third-party spools always take.
+                    gate.spool_id = self._manual_spool_overrides.get(global_gate_index, 0)
 
                 unit.gates.append(gate)
 
@@ -1287,8 +1393,10 @@ class MmuAceController:
                 and all(0 <= gate_index < global_gate_index for gate_index in previous_ttg_map)):
             self.ace.ttg_map = previous_ttg_map
 
-        # Sync MMU status with ACE Hub current_filament state
-        current_filament = filament_hub.get("current_filament", "")
+        # Absent means "the hub did not say", not "nothing loaded". Defaulting to
+        # "" made every full rebuild assert unloaded and undo what a partial update
+        # had just set, roughly every 20s during a print.
+        current_filament = filament_hub.get("current_filament")
         self._sync_loaded_gate_from_current_filament(current_filament)
 
         gates = [g for u in self.ace.units for g in u.gates]
@@ -1300,6 +1408,31 @@ class MmuAceController:
         if fingerprint != self._last_gate_fingerprint:
             self._last_gate_fingerprint = fingerprint
             self._handle_status_update(force=True)
+
+    def _spoolman_support(self) -> str:
+        """Happy Hare's off/readonly/push/pull flag, gating the spool picker in
+        Mainsail and Fluidd. Nothing inside Rinkhals reads it - only the web UIs -
+        so it is derived from whether Moonraker actually has [spoolman] configured
+        rather than exposed as yet another option for the user to set.
+
+        Resolved on every call rather than cached: [spoolman] reaches Moonraker via
+        moonraker.custom.conf, which process-cfg.py merges last, so this component is
+        constructed before the spoolman component exists and a value captured in
+        __init__ would be stuck on "off". Deriving it here also avoids hooking
+        server:klippy_ready, which issue #141 reports silently breaks ACE RFID
+        detection on the next boot. lookup_component is a dict lookup, negligible
+        next to the rest of get_status().
+
+        Keyed on *configured*, not *connected*: a flapping Spoolman connection must
+        not make the picker appear and disappear in the UI.
+
+        "readonly" rather than "push": we read spool information from Spoolman and
+        set its active spool, but never write gate-map data back into Spoolman's
+        filament records, which is what "push" means in Happy Hare.
+        """
+        if self.server.lookup_component("spoolman", None) is None:
+            return "off"
+        return "readonly"
 
     def get_status(self) -> MmuAceStatus:
 
@@ -1407,7 +1540,7 @@ class MmuAceController:
                 endless_spool_enabled = True,  # Enable endless spool for backup roll functionality
                 reason_for_pause = "",
                 extruder_filament_remaining = -1,
-                spoolman_support = "off",  # off/readonly/push/pull - we don't use spoolman
+                spoolman_support = self._spoolman_support(),
                 sensors = {},
                 espooler_active = "",
                 servo = "",
@@ -1517,9 +1650,12 @@ class MmuAceController:
                           material: str = "Unknown",
                           color: list[int] = None,
                           temperature: int = -1,
-                          spool_id: int = -1,
+                          spool_id: Optional[int] = None,
                           speed_override: int = -1
                           ):
+        """Update a gate. spool_id is tri-state: None leaves the current assignment
+        alone (the UIs send single-field edits that carry no SPOOLID), a positive
+        value assigns that Spoolman ID, and <= 0 clears the assignment."""
         # Use cached gate lookup
         gate_lookup = self._get_gate_by_index(gate_index)
         if not gate_lookup:
@@ -1533,6 +1669,16 @@ class MmuAceController:
         if color is None:
             color = [0, 0, 0, 0]
 
+        # Before the RFID-lock check on purpose: the lock is right for material,
+        # colour and temperature, which stay authoritative from the tag, but the
+        # Spoolman ID is not in the tag payload (#141). Delegated rather than just
+        # recorded, so a locked gate persists and activates too, not only displays.
+        if spool_id is not None:
+            if spool_id > 0:
+                self.set_manual_spool_id(gate_index, spool_id)
+            else:
+                self.clear_manual_spool_id(gate_index)
+
         if gate.rfid == 2:
             logging.warning(f"update gate {gate_index} not allowed, RFID tag is locked")
             return
@@ -1545,7 +1691,7 @@ class MmuAceController:
         gate.material = material
         gate.color = color
         gate.temperature = temperature
-        gate.spool_id = spool_id
+        # gate.spool_id is owned by set_manual_spool_id/clear_manual_spool_id above.
         gate.speed_override = speed_override
 
         # Try to sync with GoKlipper (only works if gate has RFID tag)
@@ -1573,6 +1719,259 @@ class MmuAceController:
         self._handle_status_update(force=True)
         logging.debug(f"updated gate {gate_index}: {material} {filament_name}")
 
+    def _sync_spool_store(self, gate_index: int, gate, sku: str):
+        """Reconcile one gate against the remembered assignments, once per rebuild.
+
+        Restores an assignment made before a restart once the gate holds the same
+        product again, and drops it when the evidence says that spool is gone: a
+        different RFID product in the gate, or the gate reading empty for
+        spool_forget_after seconds.
+
+        Never raises - this runs inside the ACE status rebuild.
+        """
+        try:
+            store = self._spool_store
+            present = gate.status != GATE_EMPTY
+
+            if store.empty_too_long(gate_index, present):
+                if gate_index in self._manual_spool_overrides or gate_index in store.entries:
+                    logging.info(f"Gate {gate_index}: empty for a while, forgetting its Spoolman ID")
+                self._manual_spool_overrides.pop(gate_index, None)
+                store.forget(gate_index)
+                self._deactivate_if_loaded(gate_index)
+                return
+
+            if not present:
+                # Whatever comes back is worth another look, even the same roll.
+                self._auto_match_seen.pop(gate_index, None)
+                return
+
+            saved = store.entries.get(gate_index)
+            if gate_index not in self._manual_spool_overrides:
+                spool_id = store.restorable(gate_index, sku)
+                if not spool_id:
+                    if store.cleared_by_user(gate_index, sku):
+                        # Unassigned on purpose. Re-matching would re-apply exactly
+                        # the mapping the user rejected, so leave it alone until the
+                        # spool itself changes.
+                        return
+                    if (gate_index in store.entries
+                            and not store.spool_swapped(gate_index, sku)):
+                        # Still believed to hold the remembered spool: its SKU has
+                        # gone but not for long enough to trust. A tag that fails
+                        # to read looks exactly like this, so wait rather than hand
+                        # the gate to the matcher, which could bind another spool.
+                        return
+                    self._maybe_auto_match(gate_index, gate, sku)
+                if spool_id and spool_id in self._manual_spool_overrides.values():
+                    # Another gate already claims this spool this session. Two gates
+                    # cannot hold one roll, and we cannot tell which is right, so
+                    # leave this one unassigned rather than guess.
+                    logging.warning(f"Gate {gate_index}: not restoring spool {spool_id}, "
+                                    "another gate already claims it")
+                    store.forget(gate_index)
+                elif spool_id:
+                    self._manual_spool_overrides[gate_index] = spool_id
+                    logging.info(f"Gate {gate_index}: restored Spoolman ID {spool_id} (same spool as before)")
+                    if gate_index == self.ace.loaded_gate:
+                        self._spawn(self._activate_spoolman_for_gate(gate_index))
+            elif store.spool_swapped(gate_index, sku):
+                previous = saved.get("sku", "") if saved else ""
+                logging.info(f"Gate {gate_index}: spool changed "
+                             f"({previous or 'no tag'} -> {sku or 'no tag'}), "
+                             "forgetting its Spoolman ID")
+                self._manual_spool_overrides.pop(gate_index, None)
+                store.forget(gate_index)
+                self._deactivate_if_loaded(gate_index)
+        except Exception as e:
+            logging.warning(f"[mmu_ace] Spoolman assignment sync failed on gate {gate_index}: {e}")
+
+    def _spawn(self, coro):
+        """Run a coroutine in the background, keeping a reference until it ends."""
+        task = self.eventloop.create_task(coro)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
+
+    def _maybe_auto_match(self, gate_index: int, gate, sku: str):
+        """Queue an unmapped gate for auto-assignment, if that is switched on.
+
+        Clamped to the spool actually changing. The rebuild runs constantly during
+        a print, and the answer for a given spool cannot change between rebuilds,
+        so asking again only costs a Spoolman round trip to be told the same thing
+        - or, worse, re-applies a mapping the user has just undone.
+
+        Called from the status rebuild, which is synchronous, so the work itself
+        runs as a task. _auto_match_inflight keeps one attempt per gate in flight.
+        """
+        if not self._matcher.enabled or gate_index in self._auto_match_inflight:
+            return
+        identity = self._matcher.identity(gate, sku)
+        if self._auto_match_seen.get(gate_index) == identity:
+            return
+        self._auto_match_seen[gate_index] = identity
+        self._auto_match_inflight.add(gate_index)
+        self._spawn(self._auto_match_gate(gate_index))
+
+    async def _auto_match_gate(self, gate_index: int):
+        """Apply whatever the matcher picks for an unmapped gate.
+
+        Everything here is about the gate still being a candidate by the time the
+        task runs; which spool it should get is the matcher's decision.
+        """
+        try:
+            if gate_index in self._manual_spool_overrides:
+                return
+            gate_lookup = self._get_gate_by_index(gate_index)
+            if not gate_lookup:
+                return
+            _, gate = gate_lookup
+            if gate.status == GATE_EMPTY:
+                return
+
+            spool_id = await self._matcher.match(gate, gate_index)
+            if not spool_id:
+                return
+            if spool_id in self._manual_spool_overrides.values():
+                # Another gate already holds this spool. One roll cannot be in two
+                # gates, and assigning it here would silently move it off the other
+                # one, leaving that gate untracked - same rule as the restore path.
+                logging.warning(f"Gate {gate_index}: auto-match chose spool {spool_id}, "
+                                "but another gate already claims it - leaving unassigned")
+                return
+            self.set_manual_spool_id(gate_index, spool_id)
+        except SpoolmanUnavailable as e:
+            # Not an answer, so it must not count as one: forget that this spool
+            # was considered, or an outage - most likely at boot - would leave the
+            # gate unmatched until it is physically changed or Moonraker restarts.
+            self._auto_match_seen.pop(gate_index, None)
+            logging.info(f"Gate {gate_index}: auto-match could not reach Spoolman "
+                         f"({e}); will retry")
+        except Exception as e:
+            logging.warning(f"[mmu_ace] Auto-match failed on gate {gate_index}: {e}")
+            self._auto_match_seen.pop(gate_index, None)
+        finally:
+            self._auto_match_inflight.discard(gate_index)
+
+
+    def _deactivate_if_loaded(self, gate_index: int):
+        """Stop tracking against a gate's spool once we no longer believe it is there.
+
+        The evidence says that spool is gone; leaving Spoolman pointed at it keeps
+        debiting a spool that is provably not in the gate.
+        """
+        if gate_index == self.ace.loaded_gate:
+            self._spawn(self._activate_spoolman_for_gate(gate_index))
+
+    def _remember_spool_assignment(self, gate_index: int, spool_id: int, sku: str):
+        """Record a user-assigned Spoolman ID for a gate.
+
+        A spool is a physical object in exactly one gate, so assigning it here
+        removes it from any other gate that still claims it. Without this, two
+        gates can hold the same ID and a print that uses both debits one Spoolman
+        spool for filament from two different rolls. Moving rather than refusing,
+        because the reason you are assigning it here is almost always that you
+        physically moved the roll.
+        """
+        for other in [g for g, s in self._manual_spool_overrides.items()
+                      if s == spool_id and g != gate_index]:
+            logging.info(f"Gate {other}: spool {spool_id} moved to gate {gate_index}, "
+                         "clearing the old assignment")
+            self._manual_spool_overrides.pop(other, None)
+            self._spool_store.forget(other)
+            self._deactivate_if_loaded(other)
+
+        self._manual_spool_overrides[gate_index] = spool_id
+        self._spool_store.remember(gate_index, spool_id, sku)
+        logging.info(f"Gate {gate_index}: remembered Spoolman ID {spool_id}")
+
+    def _forget_spool_assignment(self, gate_index: int):
+        """Drop a gate's user-assigned Spoolman ID, if it has one."""
+        forgotten = self._manual_spool_overrides.pop(gate_index, None) is not None
+        self._spool_store.forget(gate_index)
+        if forgotten:
+            logging.info(f"Gate {gate_index}: forgot its Spoolman ID")
+
+    def clear_manual_spool_id(self, gate_index: int) -> bool:
+        """Remove a gate's assignment and stop reporting it, effective immediately.
+
+        Mainsail's "reset spool" sends SPOOLID=-1 for this.
+        """
+        gate_lookup = self._get_gate_by_index(gate_index)
+        if not gate_lookup:
+            logging.warning(f"clear_manual_spool_id: gate {gate_index} not found")
+            return False
+
+        _, gate = gate_lookup
+        self._forget_spool_assignment(gate_index)
+        # Remember that this was deliberate, so auto-match does not undo it. A
+        # wholesale MMU_GATE_MAP RESET=1 deliberately does not do this: that is
+        # "start over", not "leave these gates alone".
+        self._spool_store.suppress(gate_index, getattr(gate, "sku", "") or "")
+        gate.spool_id = 0
+
+        self._handle_status_update(force=True)
+
+        # If this gate is the loaded one, Spoolman is still pointed at the spool we
+        # just unassigned; stop tracking against it.
+        if gate_index == self.ace.loaded_gate:
+            self._spawn(self._activate_spoolman_for_gate(gate_index))
+
+        return True
+
+    def clear_all_manual_spool_ids(self):
+        """Drop every assignment, live and persisted (MMU_GATE_MAP RESET=1).
+
+        The store can hold gates that are not in _manual_spool_overrides - entries
+        read back from the database before a matching gate appeared. Clearing only
+        the live map would let _sync_spool_store restore them on a later rebuild,
+        so a reset would not stay reset.
+        """
+        # A reset is "start over", so gates become matchable again.
+        self._auto_match_seen.clear()
+        gates = set(self._manual_spool_overrides) | set(self._spool_store.entries)
+        if not gates:
+            return
+        for gate_index in sorted(gates):
+            self._forget_spool_assignment(gate_index)
+            # The loaded gate's spool is still active in Spoolman and nothing
+            # claims it now, so stop debiting it - the same reasoning as clearing
+            # a single gate, which has always done this.
+            self._deactivate_if_loaded(gate_index)
+            # Stop reporting it too. Nothing rebuilds the gates while the
+            # printer is idle, so without this the map still shows the old
+            # spool until the next hub change.
+            gate_lookup = self._get_gate_by_index(gate_index)
+            if gate_lookup:
+                gate_lookup[1].spool_id = 0
+        self._handle_status_update(force=True)
+
+    def set_manual_spool_id(self, gate_index: int, spool_id: int) -> bool:
+        """Assign a Spoolman database ID to a gate, effective immediately.
+
+        Writing to _manual_spool_overrides alone only takes effect at the next ACE
+        status rebuild, up to ~20s later; this also updates the live gate so the UI
+        reflects the choice at once. Permitted on RFID-locked gates for the reason
+        given in update_gate().
+        """
+        gate_lookup = self._get_gate_by_index(gate_index)
+        if not gate_lookup:
+            logging.warning(f"set_manual_spool_id: gate {gate_index} not found")
+            return False
+
+        _, gate = gate_lookup
+        self._remember_spool_assignment(gate_index, spool_id, gate.sku)
+        gate.spool_id = spool_id
+
+        self._handle_status_update(force=True)
+
+        # If this gate is already the loaded one, nothing else will fire the
+        # loaded-gate change hook, so make Spoolman follow immediately.
+        if gate_index == self.ace.loaded_gate:
+            self._spawn(self._activate_spoolman_for_gate(gate_index))
+
+        return True
+
 class MmuAcePatcher:
 
     ace: MmuAce
@@ -1586,7 +1985,26 @@ class MmuAcePatcher:
         self.kobra = self.server.load_component(self.server.config, 'kobra')
 
         host = config.get("host", None)
-        self.ace_controller = MmuAceController(self.server, host)
+
+        # Seconds a gate must read empty before its assignment is dropped. Defaults
+        # to 0, which never drops one: that is what you want when gates hold untagged
+        # spools, since there is no SKU to detect a swap with, and it means an
+        # assignment never disappears without the user doing something. Opt in by
+        # setting a number of seconds, e.g. 300.
+        spool_forget_after = config.getfloat(
+            "spool_forget_after", MmuAceSpoolStore.DEFAULT_FORGET_AFTER_S
+        )
+        # Auto-assign an unmapped gate from Spoolman: off (default), unique - only
+        # when exactly one spool matches, or latest - break a tie by last_used.
+        # Off by default because a wrong match is silent: the next print debits that spool.
+        auto_match_mode = config.get("spool_auto_match", "off").strip().lower()
+        if auto_match_mode not in MmuAceSpoolMatcher.MODES:
+            logging.warning(f"[mmu_ace] Unknown spool_auto_match '{auto_match_mode}', using 'off'. "
+                            f"Valid: {', '.join(MmuAceSpoolMatcher.MODES)}")
+            auto_match_mode = "off"
+
+        self.ace_controller = MmuAceController(self.server, host, spool_forget_after=spool_forget_after,
+                                               auto_match_mode=auto_match_mode)
         self.ace_controller._on_ace_disabled = self._reset_mmu_status_cache
 
         # Tracks the single in-flight auto-feed poller (issue #464). patch_print_data
@@ -1616,6 +2034,7 @@ class MmuAcePatcher:
 
         # gcode handlers
         self.register_gcode_handler("MMU_GATE_MAP", self._on_gcode_mmu_gate_map)
+        self.register_gcode_handler("MMU_SET_SPOOL", self._on_gcode_mmu_set_spool)
         self.register_gcode_handler("MMU_TTG_MAP", self._on_gcode_mmu_ttg_map)
         self.register_gcode_handler("MMU_ENDLESS_SPOOL", self._on_gcode_mmu_endless_spool)
         self.register_gcode_handler("MMU_SELECT", self._on_gcode_mmu_select)
@@ -1626,6 +2045,7 @@ class MmuAcePatcher:
         self.register_gcode_handler("MMU_HOME", self._on_gcode_mmu_home)
         self.register_gcode_handler("MMU_CHECK_GATE", self._on_gcode_mmu_check_gate)
         self.register_gcode_handler("MMU_CHECK_GATES", self._on_gcode_mmu_check_gates)
+        self.register_gcode_handler("MMU_GATE_SKUS", self._on_gcode_mmu_gate_skus)
         self.register_gcode_handler("MMU_RECOVER", self._on_gcode_mmu_recover)
         self.register_gcode_handler("MMU_DRYER_START", self._on_gcode_dryer_start)
         self.register_gcode_handler("MMU_DRYER_STOP", self._on_gcode_dryer_stop)
@@ -1942,6 +2362,11 @@ class MmuAcePatcher:
             self.ace.filament.pos = FILAMENT_POS_LOADED
             self.ace_controller._handle_status_update(force=True)
 
+            # loaded_gate was just set here, so the loaded-gate sync in
+            # _sync_loaded_gate_from_current_filament will see no change on the next
+            # poll and will not fire. A manual load needs its own activation.
+            await self.ace_controller._activate_spoolman_for_gate(gate)
+
             message = f"MMU_LOAD: Loading {length}mm from gate {gate} (index {local_index}) at {speed}mm/s completed, MMU status updated"
             logging.info(message)
             await self._send_gcode_response(message)
@@ -2212,6 +2637,32 @@ class MmuAcePatcher:
         await self._send_gcode_response(message)
         return None  # Don't execute original command
 
+    async def _on_gcode_mmu_gate_skus(self, args: dict[str, str | None], delegate):
+        """List each gate's RFID SKU - the value Spoolman's filament Article number
+        needs for spool_auto_match's SKU tier - alongside its material, colour and
+        assigned spool, one console line per gate."""
+        overrides = self.ace_controller._manual_spool_overrides
+        lines = []
+        gate_index = 0
+        for unit in self.ace.units:
+            for local_index, gate in enumerate(unit.gates):
+                where = f"Gate #{gate_index} (unit {unit.id} gate {local_index})"
+                if gate.status == GATE_EMPTY:
+                    lines.append(f"{where}: EMPTY")
+                else:
+                    sku = gate.sku or "no tag"
+                    color = rgba_to_hex(gate.color)[:6] if gate.color else "?"
+                    spool_id = overrides.get(gate_index)
+                    spool = f"spool {spool_id}" if spool_id else "no spool assigned"
+                    lines.append(f"{where}: SKU {sku} - {gate.material} {color}, {spool}")
+                gate_index += 1
+
+        if not lines:
+            lines.append("no ACE gates reported")
+        for line in lines:
+            await self._send_gcode_response(f"MMU_GATE_SKUS: {line}")
+        return None  # Don't execute original command
+
     async def _on_gcode_mmu_recover(self, args: dict[str, str | None], delegate):
         """Recover MMU state by refreshing ACE status and RFID data."""
 
@@ -2291,7 +2742,41 @@ class MmuAcePatcher:
 
     # Triggered on spool edit in ui
     async def _on_gcode_mmu_gate_map(self, args: dict[str, str | None], delegate):
+        """MMU_GATE_MAP, in every form the shipped web UIs send.
+
+        Fluidd 1.35.0 sends the Happy Hare dict:
+            MMU_GATE_MAP MAP="{0: {'spool_id': 16, ...}}" QUIET=1
+        Mainsail 2.17.0 sends flat arguments, both a full spool pick and
+        single-field edits:
+            MMU_GATE_MAP GATE=0 SPOOLID=16 NAME="..." MATERIAL="..." COLOR="..." TEMP=240 QUIET=1
+            MMU_GATE_MAP GATE=0 NAME="Renamed" QUIET=1
+            MMU_GATE_MAP GATE=0 SPOOLID=-1 QUIET=1
+        Both send MMU_GATE_MAP RESET=1.
+
+        Only MAP= used to be read, so every Mainsail form failed with "param MAP not
+        found on command" and RESET=1 failed the same way (issue #141). Note this was
+        never a kobra.py shlex.split() problem: Fluidd's MAP= value is quoted and
+        survives tokenising intact, and Mainsail's flat form parses fine - the
+        handler simply did not look at those arguments.
+        """
         logging.debug(f"handle mmu_gate_map: {json.dumps(args)}")
+
+        # Tested for the value, not just presence, matching _on_gcode_mmu_ttg_map:
+        # RESET=0 is a legitimate "not a reset" and must not wipe every assignment.
+        if self._get_gcode_arg_int("RESET", args, default=0) == 1:
+            # Only the Spoolman assignments are ours to reset. Everything else in the
+            # gate map (status, material, colour, temperature) is rebuilt from the
+            # ACE hub on the next poll, so clearing it here would be undone in ~20s.
+            self.ace_controller.clear_all_manual_spool_ids()
+            return
+
+        if "GATE" in args:
+            await self._handle_gate_map_flat_args(args)
+            return
+
+        if "MAP" not in args:
+            raise ValueError("MMU_GATE_MAP requires MAP=, GATE= or RESET=1")
+
         gate_map_str = self._get_gcode_arg_str("MAP", args)
         logging.debug(f"handle mmu_gate_map gate_map_str: {gate_map_str}")
         gate_map = ast.literal_eval(gate_map_str)
@@ -2302,6 +2787,10 @@ class MmuAcePatcher:
 
             logging.debug(f"try update gate {key}: {json.dumps(value)}")
 
+            # Handled separately, and never passed to update_gate, for the reason
+            # in _apply_spool_id_arg.
+            self._apply_spool_id_arg(gate_index, value.get("spool_id"))
+
             await self.ace_controller.update_gate(
                 gate_index = gate_index,
                 status = value["status"],
@@ -2309,9 +2798,138 @@ class MmuAcePatcher:
                 material = value["material"],
                 color = hex_to_rgba(value["color"]),
                 temperature = value["temp"],
-                spool_id = value["spool_id"],
+                spool_id = None,
                 speed_override = value["speed_override"],
             )
+
+    def _apply_spool_id_arg(self, gate_index: int, requested: Optional[int]):
+        """Apply a spool_id that arrived in a gate-map command.
+
+        Fluidd commits the whole gate map on every edit, not just the gate touched,
+        so untouched gates echo their own values straight back. Three echoes have
+        to be recognised:
+
+        - the gate already holds exactly this assignment
+        - the gate holds none and the value mirrors the id we report
+        - the gate holds none and the value is the 0 we report for "unassigned"
+
+        Acting on any of them would push status per gate and re-activate Spoolman
+        for the loaded one to write what is already in place. On the last it would
+        also record a deliberate clear, stopping the gate auto-matching again.
+
+        Routed through set/clear rather than update_gate so a real change also
+        persists and activates immediately when the gate is the loaded one.
+        """
+        if requested is None:
+            return
+
+        try:
+            requested = int(requested)
+        except (TypeError, ValueError):
+            logging.warning(f"Gate {gate_index}: ignoring non-numeric spool_id {requested!r}")
+            return
+
+        if requested <= 0:
+            if self.ace_controller._manual_spool_overrides.get(gate_index) is None:
+                # The third echo above, not a request to clear.
+                logging.debug(f"Gate {gate_index}: ignoring echoed spool_id {requested} "
+                              "(gate has no assignment to clear)")
+                return
+            self.ace_controller.clear_manual_spool_id(gate_index)
+            return
+
+        gate_lookup = self.ace_controller._get_gate_by_index(gate_index)
+        if gate_lookup is None:
+            return
+        _, gate = gate_lookup
+
+        current = self.ace_controller._manual_spool_overrides.get(gate_index)
+
+        if current == requested:
+            # The first echo above.
+            logging.debug(f"Gate {gate_index}: spool {requested} already assigned, nothing to do")
+            return
+
+        if current is None and requested == gate.spool_id:
+            logging.debug(
+                f"Gate {gate_index}: ignoring echoed spool_id {requested} "
+                "(matches the value we reported, no assignment of its own)"
+            )
+            return
+
+        self.ace_controller.set_manual_spool_id(gate_index, requested)
+
+    async def _on_gcode_mmu_set_spool(self, args: dict[str, str | None], delegate):
+        """Assign a Spoolman ID to a gate: MMU_SET_SPOOL GATE=<n> SPOOLID=<id>
+
+        Does the same job as the UI's spool picker, for the console, macros and
+        slicer start-gcode. A non-positive SPOOLID clears the assignment.
+        """
+        try:
+            gate_index = self._get_gcode_arg_int("GATE", args)
+            spool_id = self._get_gcode_arg_int("SPOOLID", args)
+        except ValueError:
+            message = ("MMU_SET_SPOOL: requires GATE=<n> SPOOLID=<id>, both integers "
+                       "(note: no space after '=')")
+            logging.error(message)
+            await self._send_gcode_response(message)
+            return None
+
+        if spool_id > 0:
+            ok = self.ace_controller.set_manual_spool_id(gate_index, spool_id)
+            message = (f"Gate {gate_index} assigned Spoolman ID {spool_id}" if ok
+                       else f"MMU_SET_SPOOL: gate {gate_index} not found")
+        else:
+            ok = self.ace_controller.clear_manual_spool_id(gate_index)
+            message = (f"Gate {gate_index} Spoolman assignment cleared" if ok
+                       else f"MMU_SET_SPOOL: gate {gate_index} not found")
+
+        logging.info(message)
+        await self._send_gcode_response(message)
+        return None
+
+    async def _handle_gate_map_flat_args(self, args: dict[str, str | None]):
+        """Single-gate MMU_GATE_MAP with flat arguments (Mainsail).
+
+        Only the fields actually present are changed. Anything absent is read back
+        off the live gate and passed through unchanged - Mainsail never sends a
+        status field, and letting update_gate's GATE_EMPTY default through would
+        mark a loaded gate empty every time the user picked a spool.
+        """
+        gate_index = self._get_gcode_arg_int("GATE", args)
+
+        gate_lookup = self.ace_controller._get_gate_by_index(gate_index)
+        if not gate_lookup:
+            raise ValueError(f"MMU_GATE_MAP: gate {gate_index} not found")
+        _, gate = gate_lookup
+
+        # Handled on its own rather than through update_gate, so a single-field
+        # edit cannot turn the gate's echoed spool_id into a fresh assignment.
+        if "SPOOLID" in args:
+            self._apply_spool_id_arg(gate_index, args.get("SPOOLID"))
+
+        field_keys = ("NAME", "MATERIAL", "COLOR", "TEMP", "STATUS", "SPEED_OVERRIDE")
+        if not any(key in args for key in field_keys):
+            return
+
+        color = gate.color
+        raw_color = self._get_gcode_arg_str_def("COLOR", args, None)
+        if raw_color:
+            # A bare "COLOR" with no value parses to None. Keep the current colour
+            # rather than failing the whole command and losing the NAME/TEMP edits
+            # that came with it.
+            color = hex_to_rgba(raw_color)
+
+        await self.ace_controller.update_gate(
+            gate_index = gate_index,
+            status = self._get_gcode_arg_int("STATUS", args, default=gate.status),
+            filament_name = self._get_gcode_arg_str_def("NAME", args, gate.filament_name),
+            material = self._get_gcode_arg_str_def("MATERIAL", args, gate.material),
+            color = color,
+            temperature = self._get_gcode_arg_int("TEMP", args, default=gate.temperature),
+            spool_id = None,  # already handled above
+            speed_override = self._get_gcode_arg_int("SPEED_OVERRIDE", args, default=gate.speed_override),
+        )
 
     async def _on_gcode_dryer_start(self, args: dict[str, str | None], delegate):
         """Start dryer: MMU_DRYER_START UNIT=0 DURATION=120 [TEMP=45] [FAN_SPEED=0]
@@ -2805,6 +3423,14 @@ class MmuAcePatcher:
         self.ace.gate = gate
         self.ace.tool = gate
         self.ace.loaded_gate = gate
+
+        # Scheduled after the three assignments above, never between them.
+        # This path sets loaded_gate itself, so _sync_loaded_gate_from_current_filament
+        # sees no change on the next poll and never fires - without this, a print
+        # started by auto-feed keeps debiting whichever spool was active before.
+        self.ace_controller._spawn(
+            self.ace_controller._activate_spoolman_for_gate(gate)
+        )
 
     def _combine(self, sourceA, sourceB):
         result = {}
