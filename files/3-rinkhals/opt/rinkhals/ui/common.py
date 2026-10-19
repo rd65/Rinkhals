@@ -1727,8 +1727,13 @@ class BaseApp:
                 if USING_SIMULATOR:
                     time.sleep(1)
                     self.quit()
-                else:
-                    self.install_swu('async')
+                elif not self.install_swu('async'):
+                    lv.lock()
+                    self.modal_ota_rinkhals.obj_progress_bar.set_style_bg_color(lvr.COLOR_DANGER, lv.STATE.DEFAULT)
+                    self.modal_ota_rinkhals.label_progress_text.set_text('Installation failed')
+                    self.modal_ota_rinkhals.button_action.set_state(lv.STATE.DISABLED, False)
+                    self.modal_ota_rinkhals.button_uninstall.set_state(lv.STATE.DISABLED, False)
+                    lv.unlock()
 
                 return
             
@@ -2001,7 +2006,19 @@ class BaseApp:
             f.write(update_script)
 
         # Run the update script
-        system(f'/useremain/update_swu/update.sh {params}')
+        result = system(f'/useremain/update_swu/update.sh {params}')
+
+        # A Rinkhals update.sh run with "async" runs in the foreground and exits
+        # non-zero through quit() when the install fails (not enough space, wrong
+        # model, incomplete copy). This result used to be ignored, so a failed
+        # update rebooted exactly like a successful one, into the old version
+        # (found by mane in #170). Anycubic's update.sh has never had its exit
+        # status checked here, so that path only logs it.
+        if result != 0:
+            if params == 'async':
+                logging.error(f'Rinkhals update.sh failed with status {result}, not rebooting')
+                return False
+            logging.warning(f'update.sh returned status {result}')
 
         if os.path.exists('/useremain/rinkhals/.version'):
             if os.path.exists('/userdata/app/gk/start.sh'):
@@ -2021,3 +2038,4 @@ class BaseApp:
 
         # Sync and reboot
         system('sync && reboot')
+        return True
