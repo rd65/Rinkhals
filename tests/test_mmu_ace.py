@@ -3221,3 +3221,138 @@ class MmuAceReviewRegressionTests(MatcherTestBase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MmuAceUnmappedToolTests(unittest.TestCase):
+    """patch_print_data must not start a print that uses a tool it left out of
+    the gate mapping (issue #131). In the reported case the file used T0 and T1,
+    PETG was in gate 0 and PLA in gate 2, and T1 stayed on its default gate 1,
+    which was empty. The mapping silently dropped T1 and the print failed at its
+    first switch to PLA with "Filament is runout"."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.module = load_mmu_ace_module()
+
+    def _patcher(self, loaded, ttg_map):
+        m = self.module
+        gates = [
+            types.SimpleNamespace(
+                status=m.GATE_AVAILABLE if is_loaded else m.GATE_EMPTY,
+                color=[0, 0, 0, 255], material="PLA", filament_name="PLA",
+            )
+            for is_loaded in loaded
+        ]
+        patcher = m.MmuAcePatcher.__new__(m.MmuAcePatcher)
+        patcher.server = DummyServer()
+        patcher.ace = types.SimpleNamespace(
+            enabled=True,
+            units=[types.SimpleNamespace(gates=gates)],
+            tools=[types.SimpleNamespace() for _ in loaded],
+            ttg_map=list(ttg_map),
+            endless_spool_groups=[0] * len(loaded),
+            gate=m.TOOL_GATE_UNKNOWN,
+            loaded_gate=0,  # something is loaded, so the auto-feed path is skipped
+        )
+        return patcher
+
+    def _print(self, patcher, used_tools):
+        with mock.patch.object(self.module, "_read_referenced_tools", return_value=used_tools):
+            return self.module.MmuAcePatcher.patch_print_data(patcher, {"filename": "job.gcode"})
+
+    def test_refuses_a_print_whose_tool_maps_to_an_empty_gate(self):
+        patcher = self._patcher([True, False, True, False], [0, 1, 2, 3])
+        with self.assertRaises(RuntimeError) as raised:
+            self._print(patcher, [0, 1])
+        message = str(raised.exception)
+        self.assertIn("T1 uses gate 1, which is empty", message)
+        self.assertIn("MAP=0,1,2,3", message)
+
+    def test_the_same_print_starts_once_the_tool_is_remapped(self):
+        patcher = self._patcher([True, False, True, False], [0, 2, 2, 3])
+        data = self._print(patcher, [0, 1])
+        mapping = {(m["paint_index"], m["ams_index"]) for m in data["ams_settings"]["ams_box_mapping"]}
+        self.assertIn((0, 0), mapping)
+        self.assertIn((1, 2), mapping)
+
+    def test_empty_gates_the_print_does_not_use_are_fine(self):
+        patcher = self._patcher([True, False, True, False], [0, 1, 2, 3])
+        data = self._print(patcher, [0, 2])
+        self.assertIn("ams_settings", data)
+
+    def test_unknown_tool_list_keeps_the_old_behaviour_but_says_so(self):
+        patcher = self._patcher([True, False, True, False], [0, 1, 2, 3])
+        with self.assertLogs(level="WARNING") as logs:
+            data = self._print(patcher, None)
+        mapping = {m["paint_index"] for m in data["ams_settings"]["ams_box_mapping"]}
+        self.assertEqual(mapping, {0, 2})
+        self.assertTrue(any("T1" in line and "T3" in line for line in logs.output))
+
+    def test_a_used_tool_beyond_the_tool_count_is_refused(self):
+        patcher = self._patcher([True, True], [0, 1])
+        with self.assertRaises(RuntimeError) as raised:
+            self._print(patcher, [0, 3])
+        self.assertIn("T3 has no gate assigned", str(raised.exception))
+
+
+class MmuAceTtgMapCommandTests(unittest.IsolatedAsyncioTestCase):
+    """MMU_TTG_MAP must keep the map the same length as the tool list, reject
+    gates that don't exist, and say when a change can't reach the running print
+    (issue #131)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.module = load_mmu_ace_module()
+
+    def _patcher(self, state="standby"):
+        m = self.module
+        patcher = m.MmuAcePatcher.__new__(m.MmuAcePatcher)
+        patcher._last_ttg_reset_time = 0.0
+        patcher.ace = types.SimpleNamespace(
+            units=[types.SimpleNamespace(gates=[object()] * 4)],
+            ttg_map=[0, 1, 2, 3],
+        )
+        updates, responses = [], []
+
+        async def query_objects(objects):
+            return {"print_stats": {"state": state}}
+
+        def update_ttg_map(ttg_map):
+            updates.append(ttg_map)
+            patcher.ace.ttg_map = ttg_map
+
+        async def send_response(message):
+            responses.append(message)
+
+        patcher.ace_controller = types.SimpleNamespace(
+            update_ttg_map=update_ttg_map,
+            printer=types.SimpleNamespace(query_objects=query_objects),
+        )
+        patcher._send_gcode_response = send_response
+        return patcher, updates, responses
+
+    async def _ttg(self, patcher, args):
+        return await self.module.MmuAcePatcher._on_gcode_mmu_ttg_map(patcher, args, None)
+
+    async def test_a_partial_map_sets_the_first_tools_and_keeps_the_rest(self):
+        # What the #131 reporter typed on a four-gate ACE.
+        patcher, updates, _ = self._patcher()
+        await self._ttg(patcher, {"MAP": "0,2"})
+        self.assertEqual(updates, [[0, 2, 2, 3]])
+
+    async def test_a_gate_that_does_not_exist_is_rejected(self):
+        patcher, updates, responses = self._patcher()
+        await self._ttg(patcher, {"MAP": "0,7"})
+        self.assertEqual(updates, [])
+        self.assertTrue(any("does not exist" in r for r in responses))
+
+    async def test_changing_the_map_mid_print_says_it_applies_next_print(self):
+        patcher, updates, responses = self._patcher(state="printing")
+        await self._ttg(patcher, {"MAP": "0,2,2,3"})
+        self.assertEqual(updates, [[0, 2, 2, 3]])
+        self.assertTrue(any("next print" in r for r in responses))
+
+    async def test_no_note_when_nothing_is_printing(self):
+        patcher, _, responses = self._patcher(state="standby")
+        await self._ttg(patcher, {"MAP": "0,2,2,3"})
+        self.assertEqual(responses, [])

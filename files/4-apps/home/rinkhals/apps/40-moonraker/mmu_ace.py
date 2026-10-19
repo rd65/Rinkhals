@@ -2705,6 +2705,7 @@ class MmuAcePatcher:
             self.ace_controller.update_ttg_map(ttg_map)
             # Block further MAP updates for 2 seconds to prevent Fluidd from re-applying old map
             self._last_ttg_reset_time = time.time()
+            await self._note_ttg_map_applies_next_print()
             return None
 
         # Check if we're within cooldown period after a reset
@@ -2715,8 +2716,51 @@ class MmuAcePatcher:
             return None
 
         ttg_map_str = self._get_gcode_arg_str("MAP", args)
-        ttg_map = [int(value) for value in ttg_map_str.split(",")]
+        num_gates = sum(len(unit.gates) for unit in self.ace.units)
+        current_map = list(self.ace.ttg_map)
+        try:
+            values = [int(value) for value in ttg_map_str.split(",") if value.strip() != ""]
+        except ValueError:
+            await self._send_gcode_response(f"MMU_TTG_MAP: MAP={ttg_map_str} is not a list of gate numbers")
+            return None
+        invalid = [gate for gate in values if not 0 <= gate < num_gates]
+        if invalid:
+            await self._send_gcode_response(
+                f"MMU_TTG_MAP: gate {', '.join(str(g) for g in invalid)} does not exist "
+                f"(gates are 0 to {num_gates - 1}). The tool map was not changed."
+            )
+            return None
+        if current_map and len(values) > len(current_map):
+            await self._send_gcode_response(
+                f"MMU_TTG_MAP: MAP has {len(values)} entries but there are only "
+                f"{len(current_map)} tools. The tool map was not changed."
+            )
+            return None
+        # A partial MAP sets the first tools and keeps the rest. Storing it as-is
+        # left the map shorter than the tool list: a print started before the
+        # next ACE poll failed indexing it, and the poll itself then threw the map
+        # away because its length no longer matched (#131, where MAP=0,2 was used
+        # on a four-gate ACE).
+        ttg_map = values + current_map[len(values):]
         self.ace_controller.update_ttg_map(ttg_map)
+        await self._note_ttg_map_applies_next_print()
+
+    async def _note_ttg_map_applies_next_print(self):
+        """The tool-to-gate map reaches GoKlipper once, at print start (see
+        patch_print_data). Changing it while a print is running only changes
+        Rinkhals' own state, which the API then reports as if it had applied.
+        Say so in the console instead of letting it look applied (#131)."""
+        try:
+            result = await self.ace_controller.printer.query_objects({"print_stats": ["state"]})
+            state = str(((result or {}).get("print_stats") or {}).get("state", "") or "").lower()
+        except Exception as e:
+            logging.debug(f"MMU_TTG_MAP: could not read print state: {e}")
+            return
+        if state in ("printing", "paused"):
+            await self._send_gcode_response(
+                "MMU_TTG_MAP: the new tool map applies from the next print. "
+                "The print that is running keeps the gate mapping it started with."
+            )
 
     # Triggered on ToolToGate edit in ui
     async def _on_gcode_mmu_endless_spool(self, args: dict[str, str | None], delegate):
@@ -3138,7 +3182,14 @@ class MmuAcePatcher:
         # add gate mapping for multi color printing
         if self.ace.enabled and "ams_settings" not in print_data:
 
+            # The tools this file actually uses, from the trailer the metadata
+            # preprocessor writes at upload. None when there is no trailer.
+            filename = (print_data or {}).get("filename") or ""
+            used_tools = _read_referenced_tools(os.path.join(ACE_GCODE_DIR, filename.lstrip("/")))
+
             mapping = []
+            # (tool, gate, reason) for every tool left out of the mapping below
+            unmapped_tools = []
             for tool_index, tool in enumerate(self.ace.tools):
                 gate_index = self.ace.ttg_map[tool_index]
 
@@ -3157,12 +3208,14 @@ class MmuAcePatcher:
 
                 if not gate:
                     logging.error(f"Invalid gate_index {gate_index} for tool {tool_index}")
+                    unmapped_tools.append((tool_index, gate_index, "does not exist"))
                     continue
 
                 # Only add mapping for gates with filament (status >= 1)
                 # Empty gates (status == 0) should not be in the mapping to prevent GoKlipper errors
                 if gate.status < 1:
                     logging.info(f"Skipping empty gate {gate_index} (tool {tool_index}) in ams_box_mapping")
+                    unmapped_tools.append((tool_index, gate_index, "is empty"))
                     continue
 
                 # Add primary gate mapping
@@ -3206,6 +3259,33 @@ class MmuAcePatcher:
                                 })
                                 logging.info(f"Endless Spool: paint_index {tool_index} (T{tool_index}) can use Gate {backup_gate_index} as backup for Gate {gate_index} (group {endless_spool_group})")
 
+
+            # A tool the print uses but that we left out of the mapping is only
+            # discovered by GoKlipper at that tool's first change, possibly hours
+            # in, as "Filament is runout". Refuse to start instead, and say what to
+            # change. Issue #131: T1 was left on its default gate 1, which was
+            # empty, while the PLA it needed was loaded in gate 2.
+            if used_tools:
+                problems = [f"T{tool} uses gate {gate}, which {reason}"
+                            for tool, gate, reason in unmapped_tools if tool in used_tools]
+                problems += [f"T{tool} has no gate assigned"
+                             for tool in used_tools if tool >= len(self.ace.tools)]
+                if problems:
+                    message = (
+                        f"Not starting this print: {'; '.join(problems)}. Load filament into "
+                        "that gate, or change which gate each tool uses with MMU_TTG_MAP "
+                        f"(the current map is MAP={','.join(str(g) for g in self.ace.ttg_map)}), "
+                        "then start the print again."
+                    )
+                    logging.error(f"patch_print_data: {message}")
+                    raise self.server.error(message)
+            elif unmapped_tools:
+                logging.warning(
+                    "patch_print_data: left out of the gate mapping because their gate is empty "
+                    f"or missing: {', '.join(f'T{t}' for t, _, _ in unmapped_tools)}. "
+                    f"{filename!r} has no referenced_tools trailer, so it is unknown whether "
+                    "the print uses them."
+                )
 
             if not mapping:
                 logging.info("No ACE gate mapping available, skipping AMS settings injection")
